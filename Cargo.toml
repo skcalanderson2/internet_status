@@ -1,0 +1,13 @@
+[package]
+name = "internet_status"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+dirs = "6.0.0"
+iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
+toml = "1.1.5"
