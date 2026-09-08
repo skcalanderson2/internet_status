@@ -6,7 +6,7 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Kind;
-use crate::probe::{Hop, Outcome};
+use crate::probe::{Failure, Hop, Outcome};
 
 /// Overall verdict for one probe round, ordered from healthy to broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +18,7 @@ pub enum Status {
     Up,
     /// Some but not all Internet targets answered: packet loss, not an outage.
     Degraded,
-    /// Public IPs answer but hostnames do not resolve.
+    /// Public IPs answer but names do not resolve.
     DnsDown,
     /// The gateway answers and nothing beyond it does.
     InternetDown,
@@ -97,7 +97,14 @@ pub fn classify(outcomes: &[Outcome]) -> Status {
 
     let (dns_up, dns_total) = counts(Kind::Dns);
 
-    if dns_total > 0 && dns_up == 0 && internet_up > 0 {
+    // Only blame DNS when resolution itself failed. A hostname target that
+    // resolved and then timed out is a connectivity failure that happens to
+    // involve a name, and reporting it as "DNS down" sends you looking in the
+    // wrong place.
+    let resolution_broken = dns_total > 0
+        && by_kind(Kind::Dns).all(|outcome| outcome.failure == Some(Failure::Resolution));
+
+    if resolution_broken && internet_up > 0 {
         return Status::DnsDown;
     }
 
@@ -145,9 +152,9 @@ impl Outage {
         }
     }
 
-    pub fn close(&mut self) {
-        let ended_at = Local::now();
-
+    /// Closes the outage at `ended_at`, which is the moment connectivity came
+    /// back — not the later moment recovery was confirmed.
+    pub fn close(&mut self, ended_at: DateTime<Local>) {
         self.duration_secs = Some((ended_at - self.started_at).num_seconds());
         self.ended_at = Some(ended_at);
     }
@@ -242,6 +249,20 @@ mod tests {
             },
             latency_ms: up.then_some(10.0),
             detail: String::new(),
+            failure: (!up).then_some(Failure::Unreachable),
+        }
+    }
+
+    /// A hostname target that resolved and then failed to connect.
+    fn unreachable_after_resolving(name: &str) -> Outcome {
+        outcome(name, Kind::Dns, false)
+    }
+
+    /// A hostname target whose name would not resolve at all.
+    fn resolution_failed(name: &str) -> Outcome {
+        Outcome {
+            failure: Some(Failure::Resolution),
+            ..outcome(name, Kind::Dns, false)
         }
     }
 
@@ -283,10 +304,34 @@ mod tests {
         let round = [
             outcome("gw", Kind::Gateway, true),
             outcome("a", Kind::Internet, true),
-            outcome("d", Kind::Dns, false),
+            resolution_failed("d"),
         ];
 
         assert_eq!(classify(&round), Status::DnsDown);
+    }
+
+    #[test]
+    fn a_hostname_that_resolved_then_timed_out_is_not_a_dns_fault() {
+        // Four days of real logs labelled 34 outages "DNS down" on this shape.
+        // Resolution had succeeded every time; the connection timed out.
+        let round = [
+            outcome("gw", Kind::Gateway, true),
+            outcome("a", Kind::Internet, true),
+            unreachable_after_resolving("d"),
+        ];
+
+        assert_eq!(classify(&round), Status::Degraded);
+    }
+
+    #[test]
+    fn dead_internet_outranks_a_failing_hostname() {
+        let round = [
+            outcome("gw", Kind::Gateway, true),
+            outcome("a", Kind::Internet, false),
+            resolution_failed("d"),
+        ];
+
+        assert_eq!(classify(&round), Status::InternetDown);
     }
 
     #[test]
@@ -306,6 +351,18 @@ mod tests {
         assert_eq!(format_duration(chrono::Duration::seconds(9)), "9s");
         assert_eq!(format_duration(chrono::Duration::seconds(125)), "2m 5s");
         assert_eq!(format_duration(chrono::Duration::seconds(7300)), "2h 1m");
+    }
+
+    #[test]
+    fn closing_uses_the_moment_connectivity_returned() {
+        let mut entry = Outage::new(Status::InternetDown, &[]);
+
+        entry.started_at = Local::now() - chrono::Duration::seconds(30);
+        // Recovery is confirmed later than it happened; the log must record
+        // when the connection came back, not when we became sure of it.
+        entry.close(entry.started_at + chrono::Duration::seconds(12));
+
+        assert_eq!(entry.duration_secs, Some(12));
     }
 
     #[test]

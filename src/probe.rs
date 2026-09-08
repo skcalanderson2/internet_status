@@ -13,6 +13,18 @@ const PING: &str = "/sbin/ping";
 const TRACEROUTE: &str = "/usr/sbin/traceroute";
 const ROUTE: &str = "/sbin/route";
 
+/// Why a probe failed. Kept as a type rather than parsed back out of
+/// `detail`, because the verdict depends on the distinction: a name that will
+/// not resolve is a DNS fault, while a host that never answers is a
+/// connectivity fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The name could not be resolved.
+    Resolution,
+    /// Nothing came back from the host.
+    Unreachable,
+}
+
 /// One target's result for one probe round.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -21,6 +33,8 @@ pub struct Outcome {
     pub latency_ms: Option<f64>,
     /// Human-readable note: the resolved address, or why it failed.
     pub detail: String,
+    /// Set when the probe failed.
+    pub failure: Option<Failure>,
 }
 
 impl Outcome {
@@ -156,15 +170,16 @@ fn connect_once(address: SocketAddr, timeout: Duration) -> Result<Reached, Strin
 /// Probes one target. Hostnames are resolved first so a resolution failure is
 /// reported as such instead of looking like a routing failure.
 fn probe_target(target: &Target, timeout: Duration) -> Outcome {
-    let failed = |detail: String| Outcome {
+    let failed = |detail: String, failure: Failure| Outcome {
         target: target.clone(),
         latency_ms: None,
         detail,
+        failure: Some(failure),
     };
 
     let (address, lookup_ms) = match resolve(&target.host, target.port) {
         Ok(resolved) => resolved,
-        Err(error) => return failed(error),
+        Err(error) => return failed(error, Failure::Resolution),
     };
 
     let mut notes = Vec::new();
@@ -194,12 +209,15 @@ fn probe_target(target: &Target, timeout: Duration) -> Outcome {
                 target: target.clone(),
                 latency_ms: Some(latency_ms),
                 detail: notes.join(" · "),
+                failure: None,
             }
         }
         Err(error) => {
             notes.push(error);
 
-            failed(notes.join(" · "))
+            // Resolution already succeeded above, so anything failing here is
+            // the host not answering.
+            failed(notes.join(" · "), Failure::Unreachable)
         }
     }
 }

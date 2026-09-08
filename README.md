@@ -10,13 +10,29 @@ Built with [`iced`](https://iced.rs) 0.14.
 ## Running
 
 ```sh
-cargo run --release          # the app
+cargo run --release              # the app
 cargo run --release -- --probe   # one headless probe round, printed
+./make-app.sh                    # bundle "Internet Status.app"
 ```
 
 `--probe` runs the same checks without opening a window and prints a traceroute
 if anything upstream is failing. Useful from a shell or `cron` when the GUI
 disagrees with what you think is reachable.
+
+## Menu bar
+
+The app lives in the menu bar as a coloured dot: green online, amber packet
+loss, red outage, grey ring paused. Its menu shows the current status and
+latency, a summary of today's outages, and **Check now**, **Pause**, **Show
+window**, **Open log folder** and **Quit**.
+
+Closing the window does not quit — monitoring continues from the menu bar, and
+**Show window** brings it back. Quit from the menu.
+
+`./make-app.sh` bundles the release binary with `LSUIElement` set, so the app
+has no Dock icon and no app-switcher entry, like other menu-bar utilities. Add
+the bundle under **System Settings > General > Login Items** to have it start
+with the machine.
 
 ## How the diagnosis works
 
@@ -33,13 +49,36 @@ The verdicts, in the order they are checked:
 - **LAN DOWN** — the router itself did not answer. Nothing upstream matters yet.
 - **INTERNET DOWN** — the router answered, nothing beyond it did. The fault is
   at or past your ISP's first hop.
-- **DNS DOWN** — public addresses are reachable but hostnames do not resolve.
+- **DNS DOWN** — public addresses are reachable and a name genuinely failed to
+  *resolve*. A hostname that resolved and then timed out is not this; see
+  below.
 - **PACKET LOSS** — some targets missed replies. Usable, and *not* logged as an
   outage.
 - **ONLINE** — everything answered.
 
 An outage is only declared after `fail_threshold` consecutive bad rounds (2 by
-default), so a single dropped packet is never logged as an outage.
+default), so a single dropped packet is never logged as an outage. It is only
+closed after `recover_threshold` consecutive clean rounds (3 by default), so a
+connection that flaps for ten minutes is one outage rather than sixteen. The
+recorded end time is the *first* clean round — the moment the connection came
+back, not the later moment recovery was confirmed.
+
+The traceroute starts on the **first** bad round, before the threshold is met.
+Waiting for the threshold means the trace runs after a short outage is already
+over: in four days of logs, 95% of outages lasting 15s or less had captured a
+perfectly healthy path, because the trace began after the connection returned.
+
+### "DNS down" means resolution failed, nothing else
+
+A hostname target needs two things to succeed: the name must resolve, and the
+connection must complete. Only the first failing is a DNS fault. The probe
+records *which* one failed (`probe::Failure`) rather than leaving it to be
+guessed from the error text, because the two lead you to opposite places.
+
+This distinction was not free. An earlier version blamed DNS whenever the
+hostname target failed, and labelled 34 outages "DNS down" across four days.
+Resolution had succeeded in every one of them; the connection had timed out.
+The real cause was upstream packet loss, the same as the other 75.
 
 ### Why TCP and not ping, for the Internet targets
 
@@ -106,6 +145,7 @@ still answered while the connection was down.
 ```toml
 interval_secs = 5        # seconds between probe rounds
 fail_threshold = 2       # consecutive bad rounds before an outage is logged
+recover_threshold = 3    # consecutive clean rounds before it is closed
 timeout_ms = 2000        # per-probe timeout
 traceroute_max_hops = 15
 history_len = 240        # probe rounds kept in the latency chart
@@ -131,11 +171,24 @@ gateway target is added automatically and is not listed in the file.
 | `src/outage.rs` | Verdict classification and the JSONL log |
 | `src/config.rs` | Config file and defaults |
 | `src/chart.rs` | Latency sparkline (`iced` canvas) |
+| `src/tray.rs` | Menu-bar status item and its menu (`tray-icon`) |
 
 Probes shell out to `/sbin/ping` and `/usr/sbin/traceroute`, so the app needs no
 raw-socket privileges and no entitlement. Every probe in a round runs
 concurrently on a blocking thread pool, and a round is skipped if the previous
 one is still running.
+
+The menu-bar item has to be created and updated on the main thread, so it is
+built from the first `update` call — by then the application is running and the
+status bar will accept it — and `tray_icon`'s process-wide event channel is
+drained on a 150 ms tick rather than from a background stream.
+
+## Reading the log
+
+Records are not episodes. A flapping connection produces several records; the
+analysis that shaped this tool collapsed 109 records into 21 episodes by
+merging anything less than five minutes apart. `recover_threshold` reduces this
+but does not eliminate it, so merge before counting.
 
 ## Tests
 

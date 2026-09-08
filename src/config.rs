@@ -74,6 +74,10 @@ pub struct Config {
     /// Consecutive bad rounds required before an outage is declared. Keeps a
     /// single dropped packet from being logged as an outage.
     pub fail_threshold: u32,
+    /// Consecutive good rounds required before an outage is closed. Without
+    /// this, one flapping episode is logged as dozens of separate outages:
+    /// four days of real logs produced 109 records for 21 episodes.
+    pub recover_threshold: u32,
     /// How long a single probe may take before it counts as a failure.
     pub timeout_ms: u64,
     /// Hop limit handed to `traceroute -m`.
@@ -90,6 +94,7 @@ impl Default for Config {
         Self {
             interval_secs: 5,
             fail_threshold: 2,
+            recover_threshold: 3,
             timeout_ms: 2000,
             traceroute_max_hops: 15,
             history_len: 240,
