@@ -39,6 +39,7 @@ pub struct Tray {
     status_item: MenuItem,
     today_item: MenuItem,
     speed_item: MenuItem,
+    traffic_item: MenuItem,
     speed_run_item: MenuItem,
     pause_item: MenuItem,
     /// Last drawn appearance, so the icon is only rebuilt when it changes.
@@ -51,14 +52,16 @@ impl Tray {
         let status_item = MenuItem::new("Starting…", false, None);
         let today_item = MenuItem::new("No outages today", false, None);
         let speed_item = MenuItem::new("No speed test yet", false, None);
+        let traffic_item = MenuItem::new("Live traffic: measuring…", false, None);
         let speed_run_item = MenuItem::with_id(ID_SPEED, "Run speed test", true, None);
         let pause_item = MenuItem::with_id(ID_PAUSE, "Pause monitoring", true, None);
 
         let menu = Menu::new();
 
-        let items: [&dyn tray_icon::menu::IsMenuItem; 11] = [
+        let items: [&dyn tray_icon::menu::IsMenuItem; 12] = [
             &status_item,
             &today_item,
+            &traffic_item,
             &speed_item,
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(ID_PROBE, "Check now", true, None),
@@ -86,6 +89,7 @@ impl Tray {
             status_item,
             today_item,
             speed_item,
+            traffic_item,
             speed_run_item,
             pause_item,
             drawn: None,
@@ -115,6 +119,7 @@ impl Tray {
         self.status_item.set_text(&headline);
         self.today_item.set_text(state.today);
         self.speed_item.set_text(state.speed);
+        self.traffic_item.set_text(state.traffic);
         self.speed_run_item
             .set_enabled(state.speed_available && !state.speed_testing);
         self.pause_item.set_text(if state.paused {
@@ -144,6 +149,8 @@ pub struct State<'a> {
     pub today: &'a str,
     /// Pre-formatted latest speed-test line.
     pub speed: &'a str,
+    /// Pre-formatted live-throughput line.
+    pub traffic: &'a str,
     pub speed_testing: bool,
     /// `networkQuality` exists; without it the speed items are inert.
     pub speed_available: bool,

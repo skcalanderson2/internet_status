@@ -57,11 +57,23 @@ pub fn detect_gateway() -> Option<String> {
     parse_gateway(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Asks the routing table which interface carries the default route.
+pub fn detect_interface() -> Option<String> {
+    let output = Command::new(ROUTE).args(["-n", "get", "default"]).output().ok()?;
+
+    route_field(&String::from_utf8_lossy(&output.stdout), "interface")
+}
+
 fn parse_gateway(stdout: &str) -> Option<String> {
+    route_field(stdout, "gateway")
+}
+
+/// Reads one `key: value` line from `route get` output.
+fn route_field(stdout: &str, wanted: &str) -> Option<String> {
     stdout.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
 
-        (key.trim() == "gateway").then(|| value.trim().to_string())
+        (key.trim() == wanted).then(|| value.trim().to_string())
     })
 }
 

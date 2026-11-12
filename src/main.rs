@@ -14,6 +14,7 @@ mod config;
 mod outage;
 mod probe;
 mod speed;
+mod traffic;
 mod tray;
 
 use std::collections::VecDeque;
@@ -140,6 +141,12 @@ struct App {
     speed_testing: bool,
     /// `networkQuality` exists on this macOS.
     speed_available: bool,
+    /// The previous byte-counter sample, to difference against.
+    counters: Option<traffic::Counters>,
+    /// Live throughput from the last two samples.
+    traffic_now: Option<traffic::Rate>,
+    /// Recent rates, newest last, for the peak recorded with an outage.
+    traffic_recent: VecDeque<traffic::Rate>,
 }
 
 /// How many speed tests the window keeps on hand.
@@ -162,6 +169,8 @@ enum Message {
     SpeedTestScheduled,
     /// A speed test finished.
     SpeedTested(speed::SpeedTest),
+    /// Interface byte counters were read.
+    Sampled(Result<traffic::Counters, String>),
     TogglePause,
     /// Show or hide an outage's traceroute.
     Expand(Option<String>),
@@ -224,6 +233,9 @@ impl App {
             speed_tests: speed::load(SPEED_HISTORY),
             speed_testing: false,
             speed_available: speed::available(),
+            counters: None,
+            traffic_now: None,
+            traffic_recent: VecDeque::new(),
         };
 
         (app, Task::done(Message::ProbeNow))
@@ -324,26 +336,42 @@ impl App {
 
             Message::Quit => iced::exit(),
 
-            Message::Tick | Message::ProbeNow => {
-                // Skip the round if the previous one is still running, which
-                // happens when every target is timing out.
-                if self.probing {
-                    return Task::none();
+            // Counters are read on the regular tick only, so the rate is
+            // always measured over a full interval.
+            Message::Tick => Task::batch([
+                self.start_probe(),
+                Task::perform(traffic::sample(), Message::Sampled),
+            ]),
+
+            Message::ProbeNow => self.start_probe(),
+
+            Message::Sampled(Ok(counters)) => {
+                let rate = self
+                    .counters
+                    .as_ref()
+                    .and_then(|previous| traffic::rate(previous, &counters));
+
+                if let Some(rate) = &rate {
+                    self.traffic_recent.push_back(rate.clone());
+
+                    while self.traffic_recent.len() > traffic::RECENT {
+                        self.traffic_recent.pop_front();
+                    }
                 }
 
-                self.probing = true;
+                self.traffic_now = rate;
+                self.counters = Some(counters);
 
-                let targets = self
-                    .targets
-                    .iter()
-                    .map(|state| state.target.clone())
-                    .collect();
-                let loaded = self.speed_testing;
+                Task::none()
+            }
 
-                Task::perform(
-                    probe::probe_all(targets, self.config.clone()),
-                    move |outcomes| Message::Probed(outcomes, loaded),
-                )
+            Message::Sampled(Err(_)) => {
+                // No default route, usually: nothing to measure, and the probe
+                // round already explains why.
+                self.traffic_now = None;
+                self.counters = None;
+
+                Task::none()
             }
 
             Message::Probed(outcomes, loaded) => {
@@ -463,6 +491,8 @@ impl App {
             if self.current.is_none() && self.bad_rounds >= self.config.fail_threshold.max(1) {
                 let mut outage = Outage::new(self.status, outcomes);
 
+                outage.traffic_before = traffic::peak(&self.traffic_recent);
+
                 if let Some(hops) = self.pending_trace.take() {
                     outage.set_traceroute(hops);
                 }
@@ -514,6 +544,40 @@ impl App {
             {
                 state.record(outcome, history_len);
             }
+        }
+    }
+
+    /// Starts a probe round unless the previous one is still running, which
+    /// happens when every target is timing out.
+    fn start_probe(&mut self) -> Task<Message> {
+        if self.probing {
+            return Task::none();
+        }
+
+        self.probing = true;
+
+        let targets = self
+            .targets
+            .iter()
+            .map(|state| state.target.clone())
+            .collect();
+        let loaded = self.speed_testing;
+
+        Task::perform(
+            probe::probe_all(targets, self.config.clone()),
+            move |outcomes| Message::Probed(outcomes, loaded),
+        )
+    }
+
+    /// "Now on en0: ↓ 12.4 Mbps  ↑ 820 kbps".
+    fn traffic_summary(&self) -> String {
+        if self.paused {
+            return "Live traffic paused".into();
+        }
+
+        match &self.traffic_now {
+            Some(rate) => format!("Now on {}: {}", rate.interface, rate.headline()),
+            None => "Live traffic: measuring…".into(),
         }
     }
 
@@ -593,6 +657,7 @@ impl App {
         let today = self.today_summary();
         let latency_ms = self.charted().and_then(|state| state.latency_ms);
         let speed = self.speed_summary();
+        let traffic = self.traffic_summary();
 
         let state = tray::State {
             status: self.status,
@@ -601,6 +666,7 @@ impl App {
             last_probe: self.last_probe,
             today: &today,
             speed: &speed,
+            traffic: &traffic,
             speed_testing: self.speed_testing,
             speed_available: self.speed_available,
         };
@@ -852,11 +918,17 @@ impl App {
     }
 
     fn speed_panel(&self) -> Element<'_, Message> {
+        let live = text(self.traffic_summary()).size(12);
+
         if !self.speed_available {
             return container(
-                text("Speed tests need macOS 12 or later, which ships networkQuality.")
-                    .size(11)
-                    .style(text::secondary),
+                column![
+                    live,
+                    text("Speed tests need macOS 12 or later, which ships networkQuality.")
+                        .size(11)
+                        .style(text::secondary),
+                ]
+                .spacing(6),
             )
             .padding(12)
             .width(Fill)
@@ -872,7 +944,7 @@ impl App {
                 .style(button::secondary)
         };
 
-        let mut summary = column![text("Speed").size(14)].spacing(3);
+        let mut summary = column![text("Speed").size(14), live].spacing(3);
 
         match self.speed_tests.first() {
             Some(test) => {
@@ -884,7 +956,7 @@ impl App {
                     headline.size(12).style(text::danger)
                 });
 
-                let mut when = test.at.format("%Y-%m-%d %H:%M").to_string();
+                let mut when = test.at.format("Last test %Y-%m-%d %H:%M").to_string();
                 let details = test.details();
 
                 if !details.is_empty() {
@@ -1106,7 +1178,21 @@ fn details(entry: &Outage) -> Element<'_, Message> {
         None => text("Nothing along the path answered.").size(11),
     };
 
-    column![failed, verdict, path].spacing(6).into()
+    let mut block = column![failed, verdict].spacing(6);
+
+    if let Some(rate) = &entry.traffic_before {
+        block = block.push(
+            text(format!(
+                "Busiest traffic in the minute before, on {}: {}",
+                rate.interface,
+                rate.headline()
+            ))
+            .size(11)
+            .style(text::secondary),
+        );
+    }
+
+    block.push(path).into()
 }
 
 fn banner<'a>(message: &str, tone: Tone) -> Element<'a, Message> {

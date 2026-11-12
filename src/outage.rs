@@ -139,6 +139,11 @@ pub struct Outage {
     pub traceroute: Vec<Hop>,
     /// Where the trace stopped making progress, if it did.
     pub last_responding_hop: Option<u32>,
+    /// The busiest live-traffic sample in the minute before the outage was
+    /// declared. Heavy traffic suggests a saturated line rather than a
+    /// dead one.
+    #[serde(default)]
+    pub traffic_before: Option<crate::traffic::Rate>,
 }
 
 impl Outage {
@@ -158,6 +163,7 @@ impl Outage {
                 .collect(),
             traceroute: Vec::new(),
             last_responding_hop: None,
+            traffic_before: None,
         }
     }
 

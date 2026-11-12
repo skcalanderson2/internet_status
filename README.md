@@ -24,7 +24,8 @@ disagrees with what you think is reachable.
 
 The app lives in the menu bar as a coloured dot: green online, amber packet
 loss, red outage, grey ring paused. Its menu shows the current status and
-latency, a summary of today's outages, the latest speed test, and **Check
+latency, a summary of today's outages, live traffic, the latest speed test,
+and **Check
 now**, **Run speed test**, **Pause**, **Show window**, **Open log folder** and
 **Quit**.
 
@@ -130,6 +131,18 @@ Scheduled tests are skipped while paused or during an outage.
 While a test runs, probe rounds are still shown but kept out of outage
 detection: a saturated link times probes out exactly the way an outage does.
 
+## Live traffic
+
+Separately from speed tests, the app shows how much the machine is using
+right now — `Now on en0: ↓ 12.4 Mbps ↑ 820 kbps` — in the window and the menu
+bar. It is read from the kernel's byte counters for the default-route
+interface (`netstat -ib`) on every probe round, so it costs no data. It says
+nothing about what the line can do: an idle machine reads near zero.
+
+When an outage is declared, the busiest sample from the minute before is
+saved with it as `traffic_before`. A line that was saturated just before it
+"went down" is more likely congested than dead.
+
 ## Files
 
 All three live in `~/Library/Application Support/internet_status/`, and the **Open
@@ -155,7 +168,8 @@ still down.
   "duration_secs": 18,
   "failed_targets": ["Cloudflare (tcp/443 · timed out)"],
   "traceroute": [{ "hop": 1, "host": "192.168.88.1", "latency_ms": 2.512 }],
-  "last_responding_hop": 3
+  "last_responding_hop": 3,
+  "traffic_before": { "interface": "en0", "down_mbps": 41.2, "up_mbps": 1.3 }
 }
 ```
 
@@ -193,6 +207,7 @@ gateway target is added automatically and is not listed in the file.
 | `src/main.rs` | `iced` application: state, update, view, `--probe` and `--speedtest` |
 | `src/probe.rs` | ICMP, TCP and traceroute, plus the output parsers |
 | `src/speed.rs` | `networkQuality` runner, parser and speed-test log |
+| `src/traffic.rs` | Live throughput from interface byte counters |
 | `src/outage.rs` | Verdict classification and the JSONL log |
 | `src/config.rs` | Config file and defaults |
 | `src/chart.rs` | Latency sparkline (`iced` canvas) |
