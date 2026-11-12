@@ -65,17 +65,27 @@ fn parse_gateway(stdout: &str) -> Option<String> {
     })
 }
 
-/// Sends a single ICMP echo and returns the round-trip time.
+/// Echoes sent per probe. One lost echo must not read as an outage: on macOS
+/// a LAN host whose ARP entry is being refreshed can fail a lone echo with
+/// `recvmsg: No route to host` while answering the very next one.
+const ECHOES: &str = "3";
+
+/// Sends up to `ECHOES` ICMP echoes, stopping at the first reply, and returns
+/// its round-trip time.
 fn ping_once(host: &str, timeout: Duration) -> Result<f64, String> {
-    // `-W` bounds the wait for a reply, `-t` bounds the whole run so a wedged
-    // ping can never stall a probe round.
+    // `-o` exits on the first reply and `-i 0.2` spaces the retries closely,
+    // so a healthy host costs one echo. `-W` bounds the wait for a reply,
+    // `-t` bounds the whole run so a wedged ping can never stall a probe round.
     let deadline = timeout.as_secs().max(1) + 1;
 
     let output = Command::new(PING)
         .args([
             "-n",
+            "-o",
+            "-i",
+            "0.2",
             "-c",
-            "1",
+            ECHOES,
             "-W",
             &timeout.as_millis().to_string(),
             "-t",

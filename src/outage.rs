@@ -65,6 +65,11 @@ impl fmt::Display for Status {
 /// The gateway is checked first: if the router is unreachable there is no
 /// point blaming the ISP. Public IPs are checked next because they need no
 /// DNS, which isolates resolution failures from routing failures.
+///
+/// A failed gateway probe only means "LAN down" when nothing beyond the router
+/// answered either. Every packet to the Internet crosses the router, so a
+/// reply from any public target proves the router is forwarding; a missed
+/// gateway echo in that round is a lost packet, not a local outage.
 pub fn classify(outcomes: &[Outcome]) -> Status {
     if outcomes.is_empty() {
         return Status::Unknown;
@@ -85,7 +90,11 @@ pub fn classify(outcomes: &[Outcome]) -> Status {
 
     let (gateway_up, gateway_total) = counts(Kind::Gateway);
 
-    if gateway_total > 0 && gateway_up == 0 {
+    let beyond_router_answered = outcomes.iter().any(|outcome| {
+        matches!(outcome.target.kind, Kind::Internet | Kind::Dns) && outcome.is_up()
+    });
+
+    if gateway_total > 0 && gateway_up == 0 && !beyond_router_answered {
         return Status::LocalNetworkDown;
     }
 
@@ -108,7 +117,7 @@ pub fn classify(outcomes: &[Outcome]) -> Status {
         return Status::DnsDown;
     }
 
-    if internet_up < internet_total || dns_up < dns_total {
+    if gateway_up < gateway_total || internet_up < internet_total || dns_up < dns_total {
         return Status::Degraded;
     }
 
@@ -282,6 +291,33 @@ mod tests {
         let round = [
             outcome("gw", Kind::Gateway, false),
             outcome("a", Kind::Internet, false),
+        ];
+
+        assert_eq!(classify(&round), Status::LocalNetworkDown);
+    }
+
+    #[test]
+    fn missed_gateway_echo_with_internet_answering_is_not_a_lan_outage() {
+        // Real log shape: the router ping failed with "No route to host" while
+        // every public target answered through that same router.
+        let round = [
+            outcome("gw", Kind::Gateway, false),
+            outcome("a", Kind::Internet, true),
+            outcome("b", Kind::Internet, true),
+            outcome("d", Kind::Dns, true),
+        ];
+
+        assert_eq!(classify(&round), Status::Degraded);
+    }
+
+    #[test]
+    fn dead_gateway_with_only_a_resolved_hostname_is_still_a_lan_outage() {
+        // A name can resolve from the router's or the OS's cache; only an
+        // answer from the host itself proves the path beyond the router.
+        let round = [
+            outcome("gw", Kind::Gateway, false),
+            outcome("a", Kind::Internet, false),
+            unreachable_after_resolving("d"),
         ];
 
         assert_eq!(classify(&round), Status::LocalNetworkDown);

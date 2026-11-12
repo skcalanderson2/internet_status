@@ -29,9 +29,22 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key>   <true/>
   <!-- Menu-bar app: no Dock icon, no app switcher entry. -->
   <key>LSUIElement</key>               <true/>
+  <!-- The router probe is LAN traffic, which macOS gates behind Local
+       Network privacy. Without this string the app is never asked about. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Internet Status pings your router to tell a local fault from an ISP outage.</string>
 </dict>
 </plist>
 PLIST
+
+# Sign the whole bundle under its bundle identifier. cargo's linker leaves the
+# binary ad-hoc signed as "internet_status-<hash>", which does not match the
+# bundle ID that the Local Network grant is stored under: macOS then blocks
+# every LAN packet (ping says "No route to host") even with the toggle on.
+# Ad-hoc by default; set SIGN_IDENTITY to a certificate so the grant
+# survives rebuilds.
+codesign --force --sign "${SIGN_IDENTITY:--}" \
+  --identifier net.local.internet-status "$APP"
 
 echo "built $APP"
 echo "run it:            open '$APP'"
