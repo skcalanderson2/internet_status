@@ -255,6 +255,21 @@ pub async fn probe_all(targets: Vec<Target>, config: Config) -> Vec<Outcome> {
 }
 
 fn traceroute_blocking(host: &str, max_hops: u32) -> Vec<Hop> {
+    // Hand traceroute a resolved address, never the configured string. A host
+    // such as `-I` would otherwise be parsed as an option, and an IP literal
+    // can never start with `-`. This also keeps `-n` output consistent with
+    // the address the probe actually reached.
+    let address = match resolve(host, 0) {
+        Ok((address, _)) => address.ip().to_string(),
+        Err(error) => {
+            return vec![Hop {
+                hop: 0,
+                host: error,
+                latency_ms: None,
+            }];
+        }
+    };
+
     let output = Command::new(TRACEROUTE)
         .args([
             "-n",
@@ -264,7 +279,7 @@ fn traceroute_blocking(host: &str, max_hops: u32) -> Vec<Hop> {
             "1",
             "-m",
             &max_hops.max(1).to_string(),
-            host,
+            &address,
         ])
         .output();
 
@@ -354,6 +369,17 @@ mod tests {
         let error = resolve("no-such-host.invalid", 443).expect_err("must not resolve");
 
         assert!(error.contains("DNS lookup failed"), "{error}");
+    }
+
+    #[test]
+    fn traceroute_never_receives_an_option_as_its_host() {
+        // An option-shaped host must fail resolution before traceroute runs,
+        // rather than reaching it as a flag.
+        let hops = traceroute_blocking("-I", 1);
+
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].hop, 0);
+        assert!(hops[0].host.contains("DNS"), "{}", hops[0].host);
     }
 
     #[test]
