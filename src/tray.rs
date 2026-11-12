@@ -17,6 +17,7 @@ use crate::outage::Status;
 pub enum Action {
     ShowWindow,
     ProbeNow,
+    SpeedTest,
     TogglePause,
     OpenLog,
     Quit,
@@ -24,6 +25,7 @@ pub enum Action {
 
 const ID_SHOW: &str = "show";
 const ID_PROBE: &str = "probe";
+const ID_SPEED: &str = "speed";
 const ID_PAUSE: &str = "pause";
 const ID_LOG: &str = "log";
 const ID_QUIT: &str = "quit";
@@ -36,6 +38,8 @@ pub struct Tray {
     icon: TrayIcon,
     status_item: MenuItem,
     today_item: MenuItem,
+    speed_item: MenuItem,
+    speed_run_item: MenuItem,
     pause_item: MenuItem,
     /// Last drawn appearance, so the icon is only rebuilt when it changes.
     drawn: Option<(Status, bool)>,
@@ -46,15 +50,19 @@ impl Tray {
     pub fn new() -> Result<Self, String> {
         let status_item = MenuItem::new("Starting…", false, None);
         let today_item = MenuItem::new("No outages today", false, None);
+        let speed_item = MenuItem::new("No speed test yet", false, None);
+        let speed_run_item = MenuItem::with_id(ID_SPEED, "Run speed test", true, None);
         let pause_item = MenuItem::with_id(ID_PAUSE, "Pause monitoring", true, None);
 
         let menu = Menu::new();
 
-        let items: [&dyn tray_icon::menu::IsMenuItem; 9] = [
+        let items: [&dyn tray_icon::menu::IsMenuItem; 11] = [
             &status_item,
             &today_item,
+            &speed_item,
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(ID_PROBE, "Check now", true, None),
+            &speed_run_item,
             &pause_item,
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(ID_SHOW, "Show window", true, None),
@@ -77,6 +85,8 @@ impl Tray {
             icon,
             status_item,
             today_item,
+            speed_item,
+            speed_run_item,
             pause_item,
             drawn: None,
         })
@@ -104,6 +114,9 @@ impl Tray {
 
         self.status_item.set_text(&headline);
         self.today_item.set_text(state.today);
+        self.speed_item.set_text(state.speed);
+        self.speed_run_item
+            .set_enabled(state.speed_available && !state.speed_testing);
         self.pause_item.set_text(if state.paused {
             "Resume monitoring"
         } else {
@@ -129,6 +142,11 @@ pub struct State<'a> {
     pub last_probe: Option<DateTime<Local>>,
     /// Pre-formatted summary line for today.
     pub today: &'a str,
+    /// Pre-formatted latest speed-test line.
+    pub speed: &'a str,
+    pub speed_testing: bool,
+    /// `networkQuality` exists; without it the speed items are inert.
+    pub speed_available: bool,
 }
 
 /// Drains any menu clicks that have happened since the last call.
@@ -144,6 +162,7 @@ pub fn drain() -> Vec<Action> {
         let action = match event.id.0.as_str() {
             ID_SHOW => Action::ShowWindow,
             ID_PROBE => Action::ProbeNow,
+            ID_SPEED => Action::SpeedTest,
             ID_PAUSE => Action::TogglePause,
             ID_LOG => Action::OpenLog,
             ID_QUIT => Action::Quit,
@@ -170,8 +189,7 @@ fn dot(status: Status, paused: bool) -> Icon {
 
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let distance =
-                ((x as f32 - centre).powi(2) + (y as f32 - centre).powi(2)).sqrt();
+            let distance = ((x as f32 - centre).powi(2) + (y as f32 - centre).powi(2)).sqrt();
 
             // One pixel of feathering on each edge, so the circle is not
             // visibly stepped at 18 points.

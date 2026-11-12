@@ -86,6 +86,12 @@ pub struct Config {
     pub history_len: usize,
     /// Gateway IP. Empty means auto-detect via `route get default`.
     pub gateway: String,
+    /// Minutes between automatic speed tests; 0 turns them off. Each test
+    /// moves several hundred megabytes on a fast line, so this is opt-in.
+    /// Tests can always be run by hand from the window or the menu bar.
+    pub speedtest_interval_mins: u64,
+    /// Upper bound on one speed test, handed to `networkQuality -M`.
+    pub speedtest_max_secs: u64,
     pub targets: Vec<Target>,
 }
 
@@ -99,6 +105,8 @@ impl Default for Config {
             traceroute_max_hops: 15,
             history_len: 240,
             gateway: String::new(),
+            speedtest_interval_mins: 0,
+            speedtest_max_secs: 20,
             targets: vec![
                 Target {
                     name: "Cloudflare".into(),
@@ -148,7 +156,10 @@ impl Config {
             let config = Self::default();
 
             if let Err(error) = config.save() {
-                return (config, Some(format!("could not write {}: {error}", path.display())));
+                return (
+                    config,
+                    Some(format!("could not write {}: {error}", path.display())),
+                );
             }
 
             return (config, None);
@@ -163,7 +174,10 @@ impl Config {
                 Ok(config) => (config, None),
                 Err(error) => (
                     Self::default(),
-                    Some(format!("{} is invalid ({error}); using defaults", path.display())),
+                    Some(format!(
+                        "{} is invalid ({error}); using defaults",
+                        path.display()
+                    )),
                 ),
             },
             Err(error) => (
@@ -188,5 +202,12 @@ impl Config {
 
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.interval_secs.max(1))
+    }
+
+    /// The automatic speed-test interval, or `None` when they are off. Floored
+    /// at 15 minutes so a typo cannot saturate the line around the clock.
+    pub fn speedtest_interval(&self) -> Option<std::time::Duration> {
+        (self.speedtest_interval_mins > 0)
+            .then(|| std::time::Duration::from_secs(self.speedtest_interval_mins.max(15) * 60))
     }
 }

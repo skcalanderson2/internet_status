@@ -12,6 +12,7 @@ Built with [`iced`](https://iced.rs) 0.14.
 ```sh
 cargo run --release              # the app
 cargo run --release -- --probe   # one headless probe round, printed
+cargo run --release -- --speedtest  # one headless speed test, printed and logged
 ./make-app.sh                    # bundle "Internet Status.app"
 ```
 
@@ -23,8 +24,9 @@ disagrees with what you think is reachable.
 
 The app lives in the menu bar as a coloured dot: green online, amber packet
 loss, red outage, grey ring paused. Its menu shows the current status and
-latency, a summary of today's outages, and **Check now**, **Pause**, **Show
-window**, **Open log folder** and **Quit**.
+latency, a summary of today's outages, the latest speed test, and **Check
+now**, **Run speed test**, **Pause**, **Show window**, **Open log folder** and
+**Quit**.
 
 Closing the window does not quit — monitoring continues from the menu bar, and
 **Show window** brings it back. Quit from the menu.
@@ -111,13 +113,33 @@ Internet completely down:
 1.1.1.1:443   28.1 ms      <- an actual round trip
 ```
 
+## Speed tests
+
+Download and upload speed come from Apple's `/usr/bin/networkQuality`, which
+ships with macOS 12 and later. Besides throughput it reports
+*responsiveness* in round trips per minute while the link is loaded; a low
+figure next to high throughput is bufferbloat. On older macOS the speed panel
+says so and the menu item does nothing.
+
+A test fills the line in both directions for up to `speedtest_max_secs` and
+moves several hundred megabytes on a fast connection (about 800 MB at
+450/50 Mbps), so automatic tests are **off by default**. Run one from the
+window or the menu bar, or set `speedtest_interval_mins` (minimum 15).
+Scheduled tests are skipped while paused or during an outage.
+
+While a test runs, probe rounds are still shown but kept out of outage
+detection: a saturated link times probes out exactly the way an outage does.
+
 ## Files
 
-Both live in `~/Library/Application Support/internet_status/`, and the **Open
+All three live in `~/Library/Application Support/internet_status/`, and the **Open
 log** button reveals the folder in Finder.
 
 - `config.toml` — written with defaults on first run; edit and restart.
 - `outages.jsonl` — one JSON object per line.
+- `speedtests.jsonl` — one speed test per line: `down_mbps`, `up_mbps`,
+  `responsiveness_rpm`, `base_rtt_ms`, `interface`, `bytes_transferred`, and
+  `error` when the test failed.
 
 A record is written when the outage is detected, again when the traceroute
 finishes, and again when it ends. Later lines win on reload, so an outage that
@@ -150,6 +172,8 @@ timeout_ms = 2000        # per-probe timeout
 traceroute_max_hops = 15
 history_len = 240        # probe rounds kept in the latency chart
 gateway = ""             # blank auto-detects via `route get default`
+speedtest_interval_mins = 0  # automatic speed tests; 0 is off, minimum 15
+speedtest_max_secs = 20      # networkQuality -M; bounds one test
 
 [[targets]]
 name = "Cloudflare"
@@ -166,8 +190,9 @@ gateway target is added automatically and is not listed in the file.
 
 | File | Contents |
 | --- | --- |
-| `src/main.rs` | `iced` application: state, update, view, and `--probe` |
+| `src/main.rs` | `iced` application: state, update, view, `--probe` and `--speedtest` |
 | `src/probe.rs` | ICMP, TCP and traceroute, plus the output parsers |
+| `src/speed.rs` | `networkQuality` runner, parser and speed-test log |
 | `src/outage.rs` | Verdict classification and the JSONL log |
 | `src/config.rs` | Config file and defaults |
 | `src/chart.rs` | Latency sparkline (`iced` canvas) |

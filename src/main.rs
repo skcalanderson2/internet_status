@@ -13,6 +13,7 @@ mod chart;
 mod config;
 mod outage;
 mod probe;
+mod speed;
 mod tray;
 
 use std::collections::VecDeque;
@@ -33,6 +34,13 @@ pub fn main() -> iced::Result {
     // reachable.
     if std::env::args().any(|argument| argument == "--probe") {
         probe_once();
+
+        return Ok(());
+    }
+
+    // One headless speed test, printed and logged.
+    if std::env::args().any(|argument| argument == "--speedtest") {
+        speedtest_once();
 
         return Ok(());
     }
@@ -126,17 +134,34 @@ struct App {
     tray: Option<tray::Tray>,
     last_probe: Option<DateTime<Local>>,
     notice: Option<String>,
+    /// Recent speed tests, newest first.
+    speed_tests: Vec<speed::SpeedTest>,
+    /// A speed test is saturating the link right now.
+    speed_testing: bool,
+    /// `networkQuality` exists on this macOS.
+    speed_available: bool,
 }
+
+/// How many speed tests the window keeps on hand.
+const SPEED_HISTORY: usize = 6;
 
 #[derive(Debug, Clone)]
 enum Message {
     /// The interval elapsed.
     Tick,
-    /// A probe round finished.
-    Probed(Vec<Outcome>),
+    /// A probe round finished. The flag is set when a speed test overlapped
+    /// the round, which makes its latencies and timeouts meaningless for
+    /// outage detection.
+    Probed(Vec<Outcome>, bool),
     /// A traceroute finished, tagged with the generation it was started for.
     Traced(u64, Vec<Hop>),
     ProbeNow,
+    /// Run a speed test now, at the user's request.
+    SpeedTestNow,
+    /// The automatic speed-test interval elapsed.
+    SpeedTestScheduled,
+    /// A speed test finished.
+    SpeedTested(speed::SpeedTest),
     TogglePause,
     /// Show or hide an outage's traceroute.
     Expand(Option<String>),
@@ -196,6 +221,9 @@ impl App {
             tray: None,
             last_probe: None,
             notice,
+            speed_tests: speed::load(SPEED_HISTORY),
+            speed_testing: false,
+            speed_available: speed::available(),
         };
 
         (app, Task::done(Message::ProbeNow))
@@ -213,8 +241,15 @@ impl App {
         let mut subscriptions = Vec::new();
 
         if !self.paused {
-            subscriptions
-                .push(iced::time::every(self.config.interval()).map(|_| Message::Tick));
+            subscriptions.push(iced::time::every(self.config.interval()).map(|_| Message::Tick));
+
+            if let Some(every) = self
+                .config
+                .speedtest_interval()
+                .filter(|_| self.speed_available)
+            {
+                subscriptions.push(iced::time::every(every).map(|_| Message::SpeedTestScheduled));
+            }
         }
 
         // Keeps the "down for 42s" counter moving between probe rounds.
@@ -265,6 +300,7 @@ impl App {
                     .map(|action| match action {
                         tray::Action::ShowWindow => Task::done(Message::ShowWindow),
                         tray::Action::ProbeNow => Task::done(Message::ProbeNow),
+                        tray::Action::SpeedTest => Task::done(Message::SpeedTestNow),
                         tray::Action::TogglePause => Task::done(Message::TogglePause),
                         tray::Action::OpenLog => Task::done(Message::RevealLog),
                         tray::Action::Quit => Task::done(Message::Quit),
@@ -297,18 +333,60 @@ impl App {
 
                 self.probing = true;
 
-                let targets = self.targets.iter().map(|state| state.target.clone()).collect();
+                let targets = self
+                    .targets
+                    .iter()
+                    .map(|state| state.target.clone())
+                    .collect();
+                let loaded = self.speed_testing;
 
                 Task::perform(
                     probe::probe_all(targets, self.config.clone()),
-                    Message::Probed,
+                    move |outcomes| Message::Probed(outcomes, loaded),
                 )
             }
 
-            Message::Probed(outcomes) => {
+            Message::Probed(outcomes, loaded) => {
                 self.probing = false;
                 self.last_probe = Some(Local::now());
+
+                // A round that overlapped a speed test, at either end, is
+                // shown but kept out of the outage state machine: a saturated
+                // link times probes out exactly the way an outage does.
+                if loaded || self.speed_testing {
+                    self.record(&outcomes);
+                    return Task::none();
+                }
+
                 self.apply(&outcomes)
+            }
+
+            Message::SpeedTestNow => self.start_speed_test(),
+
+            Message::SpeedTestScheduled => {
+                // Only measure a healthy line: during an outage the test would
+                // just fail, and during recovery it would blind detection.
+                let healthy =
+                    matches!(self.status, Status::Up | Status::Degraded) && self.current.is_none();
+
+                if healthy {
+                    self.start_speed_test()
+                } else {
+                    Task::none()
+                }
+            }
+
+            Message::SpeedTested(test) => {
+                self.speed_testing = false;
+
+                if let Err(error) = speed::append(&test) {
+                    self.notice = Some(format!("could not write the speed-test log: {error}"));
+                }
+
+                self.speed_tests.insert(0, test);
+                self.speed_tests.truncate(SPEED_HISTORY);
+
+                Task::none()
             }
 
             Message::Traced(seq, hops) => {
@@ -363,17 +441,7 @@ impl App {
     /// Folds a finished probe round into the state and drives the outage
     /// state machine.
     fn apply(&mut self, outcomes: &[Outcome]) -> Task<Message> {
-        let history_len = self.config.history_len;
-
-        for outcome in outcomes {
-            if let Some(state) = self
-                .targets
-                .iter_mut()
-                .find(|state| state.target.name == outcome.target.name)
-            {
-                state.record(outcome, history_len);
-            }
-        }
+        self.record(outcomes);
 
         self.status = outage::classify(outcomes);
 
@@ -433,6 +501,55 @@ impl App {
         Task::none()
     }
 
+    /// Updates each target's live reading and history, without judging the
+    /// round.
+    fn record(&mut self, outcomes: &[Outcome]) {
+        let history_len = self.config.history_len;
+
+        for outcome in outcomes {
+            if let Some(state) = self
+                .targets
+                .iter_mut()
+                .find(|state| state.target.name == outcome.target.name)
+            {
+                state.record(outcome, history_len);
+            }
+        }
+    }
+
+    /// Starts a speed test unless one is already running.
+    fn start_speed_test(&mut self) -> Task<Message> {
+        if self.speed_testing || !self.speed_available {
+            return Task::none();
+        }
+
+        self.speed_testing = true;
+
+        Task::perform(
+            speed::run(self.config.speedtest_max_secs),
+            Message::SpeedTested,
+        )
+    }
+
+    /// One line for the menu bar: the latest result, or what is happening.
+    fn speed_summary(&self) -> String {
+        if !self.speed_available {
+            return "Speed tests need macOS 12+".into();
+        }
+
+        if self.speed_testing {
+            return "Speed test running…".into();
+        }
+
+        match self.speed_tests.first() {
+            Some(test) if test.succeeded() => {
+                format!("{} · {}", test.headline(), test.at.format("%H:%M"))
+            }
+            Some(test) => format!("Speed test {}", test.headline()),
+            None => "No speed test yet".into(),
+        }
+    }
+
     /// Starts a traceroute for the current episode.
     fn start_trace(&mut self) -> Task<Message> {
         let Some(host) = self.trace_host() else {
@@ -475,6 +592,7 @@ impl App {
     fn refresh_tray(&mut self) {
         let today = self.today_summary();
         let latency_ms = self.charted().and_then(|state| state.latency_ms);
+        let speed = self.speed_summary();
 
         let state = tray::State {
             status: self.status,
@@ -482,6 +600,9 @@ impl App {
             latency_ms,
             last_probe: self.last_probe,
             today: &today,
+            speed: &speed,
+            speed_testing: self.speed_testing,
+            speed_available: self.speed_available,
         };
 
         if let Some(tray) = &mut self.tray {
@@ -503,7 +624,10 @@ impl App {
             return "No outages today".into();
         }
 
-        let seconds: i64 = entries.iter().map(|entry| entry.duration().num_seconds()).sum();
+        let seconds: i64 = entries
+            .iter()
+            .map(|entry| entry.duration().num_seconds())
+            .sum();
         let plural = if entries.len() == 1 { "" } else { "s" };
 
         format!(
@@ -538,6 +662,7 @@ impl App {
             rule::horizontal(1),
             self.targets_panel(),
             self.chart_panel(),
+            self.speed_panel(),
             self.history_panel(),
             footer,
         ]
@@ -647,11 +772,13 @@ impl App {
                 Tone::Bad
             };
 
-            let dot = container(space::Space::new().width(9).height(9))
-                .style(move |theme: &Theme| container::Style {
-                    background: Some(tone.pair(theme).color.into()),
-                    border: iced::border::rounded(5),
-                    ..container::Style::default()
+            let dot =
+                container(space::Space::new().width(9).height(9)).style(move |theme: &Theme| {
+                    container::Style {
+                        background: Some(tone.pair(theme).color.into()),
+                        border: iced::border::rounded(5),
+                        ..container::Style::default()
+                    }
                 });
 
             let reading = match state.latency_ms {
@@ -663,17 +790,25 @@ impl App {
                 dot,
                 column![
                     text(&state.target.name).size(13),
-                    text(format!("{} · {}", state.target.host, describe(&state.target)))
-                        .size(10)
-                        .style(text::secondary),
+                    text(format!(
+                        "{} · {}",
+                        state.target.host,
+                        describe(&state.target)
+                    ))
+                    .size(10)
+                    .style(text::secondary),
                 ]
                 .spacing(2)
                 .width(Length::FillPortion(2)),
                 column![
                     reading,
-                    text(format!("{:.1}% loss over {} probes", state.loss_percent(), state.probes))
-                        .size(10)
-                        .style(text::secondary),
+                    text(format!(
+                        "{:.1}% loss over {} probes",
+                        state.loss_percent(),
+                        state.probes
+                    ))
+                    .size(10)
+                    .style(text::secondary),
                 ]
                 .spacing(2)
                 .width(Length::FillPortion(1)),
@@ -716,6 +851,106 @@ impl App {
             .into()
     }
 
+    fn speed_panel(&self) -> Element<'_, Message> {
+        if !self.speed_available {
+            return container(
+                text("Speed tests need macOS 12 or later, which ships networkQuality.")
+                    .size(11)
+                    .style(text::secondary),
+            )
+            .padding(12)
+            .width(Fill)
+            .style(container::bordered_box)
+            .into();
+        }
+
+        let run = if self.speed_testing {
+            button(text("Testing…").size(12)).style(button::secondary)
+        } else {
+            button(text("Run speed test").size(12))
+                .on_press(Message::SpeedTestNow)
+                .style(button::secondary)
+        };
+
+        let mut summary = column![text("Speed").size(14)].spacing(3);
+
+        match self.speed_tests.first() {
+            Some(test) => {
+                let headline = text(test.headline()).size(16);
+
+                summary = summary.push(if test.succeeded() {
+                    headline
+                } else {
+                    headline.size(12).style(text::danger)
+                });
+
+                let mut when = test.at.format("%Y-%m-%d %H:%M").to_string();
+                let details = test.details();
+
+                if !details.is_empty() {
+                    when = format!("{when} · {details}");
+                }
+
+                summary = summary.push(text(when).size(10).style(text::secondary));
+            }
+            None => {
+                summary = summary.push(
+                    text("No speed test yet. A test uses several hundred MB on a fast line.")
+                        .size(11)
+                        .style(text::secondary),
+                );
+            }
+        }
+
+        let earlier: Vec<String> = self
+            .speed_tests
+            .iter()
+            .skip(1)
+            .filter(|test| test.succeeded())
+            .map(|test| {
+                format!(
+                    "{} ↓{} ↑{}",
+                    test.at.format("%m-%d %H:%M"),
+                    speed::format_mbps(test.down_mbps).trim_end_matches(" Mbps"),
+                    speed::format_mbps(test.up_mbps).trim_end_matches(" Mbps"),
+                )
+            })
+            .collect();
+
+        if !earlier.is_empty() {
+            summary = summary.push(
+                text(format!("Earlier (Mbps): {}", earlier.join("   ")))
+                    .size(10)
+                    .style(text::secondary),
+            );
+        }
+
+        let schedule = match self.config.speedtest_interval() {
+            Some(every) => format!("Automatic every {} min", every.as_secs() / 60),
+            None => "Automatic tests off".into(),
+        };
+
+        let side = column![run, text(schedule).size(10).style(text::secondary)]
+            .spacing(4)
+            .align_x(iced::Alignment::End);
+
+        let mut panel =
+            column![row![summary, space::horizontal(), side].align_y(Center)].spacing(8);
+
+        if self.speed_testing {
+            panel = panel.push(banner(
+                "Speed test running — outage detection is paused until it finishes.",
+                Tone::Warning,
+            ));
+        }
+
+        container(panel)
+            .padding(12)
+            .width(Fill)
+            .style(container::bordered_box)
+            .into()
+    }
+
     fn history_panel(&self) -> Element<'_, Message> {
         let heading = row![
             text(format!("Outage log ({})", self.outages.len())).size(14),
@@ -751,7 +986,11 @@ impl App {
         let when = entry.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
         let ended = match entry.ended_at {
             Some(at) => format!("recovered {}", at.format("%H:%M:%S")),
-            None if self.current.as_ref().is_some_and(|open| open.id == entry.id) => {
+            None if self
+                .current
+                .as_ref()
+                .is_some_and(|open| open.id == entry.id) =>
+            {
                 "ongoing".into()
             }
             // An open record from a previous run: the app stopped before the
@@ -759,13 +998,9 @@ impl App {
             None => "end unknown (app stopped)".into(),
         };
 
-        let toggle = button(
-            text(if expanded { "Hide path" } else { "Show path" }).size(11),
-        )
-        .on_press(Message::Expand(
-            (!expanded).then(|| entry.id.clone()),
-        ))
-        .style(button::text);
+        let toggle = button(text(if expanded { "Hide path" } else { "Show path" }).size(11))
+            .on_press(Message::Expand((!expanded).then(|| entry.id.clone())))
+            .style(button::text);
 
         let summary = row![
             text(entry.status.label()).size(12).style(text::danger),
@@ -828,7 +1063,9 @@ impl canvas::Program<Message> for ChartOwner {
 
 fn details(entry: &Outage) -> Element<'_, Message> {
     let failed = if entry.failed_targets.is_empty() {
-        text("No failing targets were recorded.").size(11).style(text::secondary)
+        text("No failing targets were recorded.")
+            .size(11)
+            .style(text::secondary)
     } else {
         text(format!("Failed: {}", entry.failed_targets.join(", ")))
             .size(11)
@@ -836,7 +1073,10 @@ fn details(entry: &Outage) -> Element<'_, Message> {
     };
 
     let path: Element<'_, Message> = if entry.traceroute.is_empty() {
-        text("No traceroute was captured.").size(11).style(text::secondary).into()
+        text("No traceroute was captured.")
+            .size(11)
+            .style(text::secondary)
+            .into()
     } else {
         let hops = entry.traceroute.iter().map(|hop| {
             let timing = match hop.latency_ms {
@@ -877,7 +1117,13 @@ fn banner<'a>(message: &str, tone: Tone) -> Element<'a, Message> {
             let pair = tone.pair(theme);
 
             container::Style {
-                background: Some(Color { a: 0.18, ..pair.color }.into()),
+                background: Some(
+                    Color {
+                        a: 0.18,
+                        ..pair.color
+                    }
+                    .into(),
+                ),
                 border: iced::border::rounded(6),
                 ..container::Style::default()
             }
@@ -993,5 +1239,51 @@ fn probe_once() {
                 }
             }
         }
+    }
+}
+
+/// Runs one speed test, prints it and appends it to the log. Used by
+/// `--speedtest`.
+fn speedtest_once() {
+    if !speed::available() {
+        eprintln!("networkQuality is not available; it ships with macOS 12 and later");
+        return;
+    }
+
+    let (config, notice) = Config::load();
+
+    if let Some(notice) = notice {
+        eprintln!("note: {notice}");
+    }
+
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("could not start a runtime: {error}");
+            return;
+        }
+    };
+
+    println!(
+        "running networkQuality (up to {} s)…",
+        config.speedtest_max_secs
+    );
+
+    let test = runtime.block_on(speed::run(config.speedtest_max_secs));
+
+    println!("{}", test.headline());
+
+    let details = test.details();
+
+    if !details.is_empty() {
+        println!("{details}");
+    }
+
+    if let Some(endpoint) = &test.endpoint {
+        println!("server: {endpoint}");
+    }
+
+    if let Err(error) = speed::append(&test) {
+        eprintln!("could not write {}: {error}", speed::log_path().display());
     }
 }
